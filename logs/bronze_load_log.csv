@@ -1,0 +1,6 @@
+table,file,rows,checksum
+bronze.patients,patients.csv,50000,9b224436db13a66c27ed9ef92efefdd4
+bronze.doctors,doctors.csv,50000,af15091b1b92d0d5af6d4fe3aa06dd7c
+bronze.appointments,appointments.csv,50000,9b94e836796ecda3827f339529898ba8
+bronze.prescriptions,prescriptions.csv,50000,d85dfefdad6ed66f5d802f09dd3b4b19
+bronze.billing,billing.csv,50000,ead7ec27f65c756640414f69b3af10f3
