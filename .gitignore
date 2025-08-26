@@ -11,3 +11,4 @@ logs/
 
 # Ignore environment files
 .env
+config/service_account.json
