@@ -208,4 +208,4 @@ def build_gold(conn):
 
     conn.commit()
     cursor.close()
-    logging.info("Gold Layer build complete ")
+    logging.info("Gold Layer build complete ✅")
