@@ -6,7 +6,7 @@ from silver_transform import (
     transform_appointments, transform_prescriptions, transform_billing
 )
 from gold_transform import build_gold
-
+from load import run_bronze_load
 # -------------------------
 # Logging setup
 # -------------------------
@@ -17,6 +17,15 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
+
+# -------------------------
+# Bronze Builder
+# -------------------------
+def build_bronze():
+    logging.info("=== Building Bronze Layer Started ===")
+    run_bronze_load(truncate=True)   # set to True if you want clean bronze on every run
+    logging.info("=== Building Bronze Layer Completed ===")
+
 
 # -------------------------
 # Silver Builder
@@ -61,11 +70,14 @@ if __name__ == "__main__":
     # Accept command-line args: silver | gold | all
     task = sys.argv[1] if len(sys.argv) > 1 else "all"
 
-    if task == "silver":
+    if task == "bronze":
+        build_bronze()
+    elif task == "silver":
         build_silver()
     elif task == "gold":
         build_gold_layer()
     elif task == "all":
+        build_bronze()  
         build_silver()
         build_gold_layer()
     else:
