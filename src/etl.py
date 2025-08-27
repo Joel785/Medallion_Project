@@ -8,11 +8,12 @@ from silver_transform import (
 from gold_transform import build_gold
 from load import run_bronze_load
 from export_to_sheets import export_gold_to_sheets
+from extract_from_csv import export_tabs_to_bronze_inputs
 
 from dotenv import load_dotenv
 load_dotenv()
 
-import time
+import time 
 def _run_step(name, fn):
     start = time.time()
     logging.info(f"=== {name} Started ===")
@@ -33,6 +34,25 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
+
+
+# -------------------------
+# Extract From Csv
+# -------------------------
+
+
+def extract():
+    try:
+        logging.info("=== Extract from Google Sheets Started ===")
+        stats = export_tabs_to_bronze_inputs()
+        # optional compact summary
+        logging.info("Extract summary: " + ", ".join([f"{t}:{r}" for t, r, _, _ in stats]))
+        logging.info("=== Extract from Google Sheets Completed ===")
+    except Exception as e:
+        logging.error(f"Error in extract: {e}")
+        raise
+
+
 
 # -------------------------
 # Bronze Builder
@@ -96,10 +116,12 @@ def export_sheets():
 if __name__ == "__main__":
     import sys
 
-    # Accept command-line args: bronze | silver | gold | export_sheets | all
+    # Accept command-line args: extract | bronze | silver | gold | export_sheets | all
     task = sys.argv[1] if len(sys.argv) > 1 else "all"
 
-    if task == "bronze":
+    if task == "extract":
+        _run_step("Extract (Sheets → bronze_inputs CSVs)", extract)
+    elif task == "bronze":
         _run_step("Bronze Layer", build_bronze)
     elif task == "silver":
         _run_step("Silver Layer", build_silver)
@@ -108,10 +130,10 @@ if __name__ == "__main__":
     elif task == "export_sheets":
         _run_step("Export to Google Sheets", export_sheets)
     elif task == "all":
+        _run_step("Extract (Sheets → bronze_inputs CSVs)", extract)
         _run_step("Bronze Layer", build_bronze)
         _run_step("Silver Layer", build_silver)
         _run_step("Gold Layer", build_gold_layer)
         _run_step("Export to Google Sheets", export_sheets)
     else:
-        print("Usage: python etl.py [bronze|silver|gold|export_sheets|all]")
-
+        print("Usage: python etl.py [extract|bronze|silver|gold|export_sheets|all]")

@@ -21,7 +21,7 @@ from gspread_dataframe import set_with_dataframe
 load_dotenv()
 
 DB_URL = os.getenv("DB_URL")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+GOLD_SPREADSHEET_ID = os.getenv("GOLD_SPREADSHEET_ID") 
 SERVICE_ACCOUNT_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
 LOGS_DIR = os.getenv("LOGS_DIR", "./logs")
@@ -146,7 +146,7 @@ def export_gold_to_sheets():
     logging.info("Gold→Sheets export started")
     engine = _engine()
     gc = _gspread()
-    sh = gc.open_by_key(SPREADSHEET_ID)
+    sh = gc.open_by_key(GOLD_SPREADSHEET_ID)
 
     run_stats = []
 
