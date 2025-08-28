@@ -5,9 +5,10 @@ import re
 import time
 import hashlib
 import logging
-from datetime import datetime, timezone
-
+from datetime import datetime, date, time as dtime
+import numpy as np
 import pandas as pd
+
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
@@ -20,30 +21,24 @@ from gspread_dataframe import set_with_dataframe
 # -------------------------------------------------
 load_dotenv()
 
-DB_URL = os.getenv("DB_URL")
-GOLD_SPREADSHEET_ID = os.getenv("GOLD_SPREADSHEET_ID") 
+DB_URL               = os.getenv("DB_URL")
+GOLD_SPREADSHEET_ID  = os.getenv("GOLD_SPREADSHEET_ID")
 SERVICE_ACCOUNT_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
-LOGS_DIR = os.getenv("LOGS_DIR", "./logs")
-os.makedirs(LOGS_DIR, exist_ok=True)
+# export tuning
+CHUNK_ROWS       = 2000
+MAX_RETRIES      = 5
+RETRY_BASE_SLEEP = 1.5
+RESIZE_STEP_ROWS = 10000
+RESIZE_STEP_COLS = 50
 
-# If your main ETL already configures logging, you can remove this.
-logging.basicConfig(
-    filename=os.path.join(LOGS_DIR, "export_to_sheets.log"),
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+ROW_LIMITS = {
+    # Uncomment if you want to cap big tables
+    # "appointment_utilization_doctor": 30000,
+    # "appointment_utilization_patient": 30000,
+    # "outstanding_revenue": 20000,
+}
 
-# -------------------------------------------------
-# Tunables for rate limits
-# -------------------------------------------------
-RATE_LIMIT_SLEEP_PER_TABLE = float(os.getenv("GSHEETS_SLEEP_PER_TABLE", "1.0"))  # seconds between tables
-MAX_RETRIES = int(os.getenv("GSHEETS_MAX_RETRIES", "5"))
-BASE_SLEEP = float(os.getenv("GSHEETS_BASE_SLEEP", "1.0"))  # base backoff (1, 2, 4, 8, 16...)
-
-# -------------------------------------------------
-# Gold tables (stable order & names => stable tabs)
-# -------------------------------------------------
 GOLD_TABLES = [
     "revenue_by_department",
     "revenue_by_payment_method",
@@ -60,164 +55,172 @@ GOLD_TABLES = [
     "dashboard_summary",
 ]
 
-# -------------------------------------------------
-# Helpers
-# -------------------------------------------------
-def _engine():
-    if not DB_URL:
-        raise RuntimeError("DB_URL not set in environment/.env")
-    return create_engine(DB_URL)
+# ----------------------
+# LOGGING
+# ----------------------
+os.makedirs("logs", exist_ok=True)
+logger = logging.getLogger("export_to_sheets")
+logger.setLevel(logging.INFO)
+logger.handlers.clear()
+fh = logging.FileHandler("logs/export_to_sheets.log", encoding="utf-8")
+fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+logger.addHandler(fh)
 
-def _gspread():
-    if not SERVICE_ACCOUNT_PATH or not os.path.exists(SERVICE_ACCOUNT_PATH):
-        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS path invalid or missing")
-    return gspread.service_account(filename=SERVICE_ACCOUNT_PATH)
 
-def _md5_df(df: pd.DataFrame) -> str:
-    buf = io.BytesIO()
-    df.to_csv(buf, index=False)
-    return hashlib.md5(buf.getvalue()).hexdigest()
-
-def _is_429(e: Exception) -> bool:
-    # gspread APIError string contains "[429]" for rate-limit
-    return isinstance(e, APIError) and re.search(r"\[429\]", str(e)) is not None
-
-def _retry(callable_, *args, **kwargs):
-    """Retry wrapper for gspread calls with exponential backoff on 429."""
-    attempt = 0
-    while True:
+# ----------------------
+# HELPERS
+# ----------------------
+def _retry(fn, *args, **kwargs):
+    for i in range(MAX_RETRIES):
         try:
-            return callable_(*args, **kwargs)
-        except Exception as e:
-            if _is_429(e) and attempt < MAX_RETRIES:
-                sleep_s = BASE_SLEEP * (2 ** attempt)
-                logging.warning(f"429 rate limit hit; retrying in {sleep_s:.1f}s (attempt {attempt+1}/{MAX_RETRIES})")
+            return fn(*args, **kwargs)
+        except APIError as e:
+            msg = str(e)
+            transient = any(code in msg for code in ("429", "500", "503"))
+            if transient and i < MAX_RETRIES - 1:
+                sleep_s = RETRY_BASE_SLEEP * (2 ** i)
+                logger.warning(f"{fn.__name__} retry {i+1}/{MAX_RETRIES} after {sleep_s:.1f}s due to: {e}")
                 time.sleep(sleep_s)
-                attempt += 1
                 continue
             raise
 
+
 def _ensure_ws(sh, title: str, rows: int, cols: int):
-    """
-    Get or create worksheet by title; resize & clear.
-    Returns (worksheet, created_bool).
-    """
     try:
-        ws = _retry(sh.worksheet, title)  # read op
-        # Writes: resize + clear
-        _retry(ws.resize, max(rows, 2), max(cols, 2))
-        _retry(ws.clear)
-        return ws, False
-    except WorksheetNotFound:
+        ws = sh.worksheet(title)
+        created = False
+    except gspread.exceptions.WorksheetNotFound:
         ws = _retry(sh.add_worksheet, title=title, rows=max(rows, 2), cols=max(cols, 2))
-        return ws, True
+        created = True
 
-def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Light coercions so Looker Studio infers types well.
-    Adjust/extend rules per your schemas if needed.
-    """
-    if df.empty:
-        return df
+    try:
+        need_rows = rows > ws.row_count
+        need_cols = cols > ws.col_count
+        if need_rows or need_cols:
+            r = ws.row_count
+            c = ws.col_count
+            target_r = max(rows, 2)
+            target_c = max(cols, 2)
+            while r < target_r or c < target_c:
+                r = min(target_r, r + RESIZE_STEP_ROWS) if r < target_r else r
+                c = min(target_c, c + RESIZE_STEP_COLS) if c < target_c else c
+                _retry(ws.resize, r, c)
+                time.sleep(0.2)
+    except Exception as e:
+        logger.warning(f"Resize skipped for '{title}': {e}")
 
-    # Numeric-ish columns by suffix/keywords
-    for col in df.columns:
-        low = col.lower()
-        if low.endswith(("_amount", "_revenue", "_count", "_total")) or low in {"revenue", "amount", "count", "total"}:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return ws, created
 
-        # Dates: cast to ISO string YYYY-MM-DD (or keep as datetime and let LS infer)
-        if "date" in low or low.endswith(("_dt", "_at")):
-            try:
-                # If monthly aggregations like '2025-08' exist, keep as-is
-                parsed = pd.to_datetime(df[col], errors="coerce")
-                # If it's all date-like, convert to date string
-                if parsed.notna().sum() > 0:
-                    df[col] = parsed.dt.strftime("%Y-%m-%d")
-            except Exception:
-                pass
 
-    return df
+def _clear_ws(ws):
+    try:
+        _retry(ws.clear)
+    except Exception as e:
+        logger.warning(f"Clear skipped for '{ws.title}': {e}")
 
-# -------------------------------------------------
-# Main export
-# -------------------------------------------------
+
+def _to_sheet_friendly(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert date/time/etc. into strings/None for Sheets API."""
+    out = df.copy()
+
+    for col in out.columns:
+        s = out[col]
+        if pd.api.types.is_datetime64_any_dtype(s):
+            out[col] = s.dt.strftime("%Y-%m-%d %H:%M:%S").where(~s.isna(), None)
+        elif pd.api.types.is_timedelta64_dtype(s):
+            out[col] = s.astype("string").where(~s.isna(), None)
+        elif hasattr(pd.api.types, "is_period_dtype") and pd.api.types.is_period_dtype(s):
+            out[col] = s.astype("string").where(~s.isna(), None)
+
+    def _cell(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return None
+        if isinstance(v, (pd.Timestamp, datetime)):
+            return v.strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(v, date):
+            return v.isoformat()
+        if isinstance(v, dtime):
+            return v.strftime("%H:%M:%S")
+        if isinstance(v, (np.integer,)):
+            return int(v)
+        if isinstance(v, (np.floating,)):
+            return float(v)
+        if isinstance(v, (np.bool_,)):
+            return bool(v)
+        return v
+
+    for col in out.columns:
+        if out[col].dtype == "object":
+            out[col] = out[col].map(_cell)
+
+    out = out.where(pd.notnull(out), None)
+    return out
+
+
+def _write_dataframe_chunked(ws, df: pd.DataFrame, chunk_size: int = CHUNK_ROWS):
+    df_norm = _to_sheet_friendly(df)
+
+    # header
+    header = [list(map(str, df_norm.columns.tolist()))]
+    _retry(ws.update, "A1", header)
+    time.sleep(0.1)
+
+    n = len(df_norm)
+    if n == 0:
+        return
+
+    for start in range(0, n, chunk_size):
+        end = min(n, start + chunk_size)
+        values = df_norm.iloc[start:end].values.tolist()
+        a1_row = 2 + start
+        a1_range = f"A{a1_row}"
+        _retry(ws.update, a1_range, values)
+        logger.info(f"[{ws.title}] wrote rows {start+1}–{end}")
+        time.sleep(0.2)
+
+
+# ----------------------
+# MAIN EXPORT
+# ----------------------
 def export_gold_to_sheets():
-    logging.info("Gold→Sheets export started")
-    engine = _engine()
-    gc = _gspread()
+    if not all([DB_URL, GOLD_SPREADSHEET_ID, SERVICE_ACCOUNT_PATH]):
+        raise RuntimeError("Missing DB_URL / GOLD_SPREADSHEET_ID / GOOGLE_APPLICATION_CREDENTIALS")
+
+    engine = create_engine(DB_URL)
+    gc = gspread.service_account(filename=SERVICE_ACCOUNT_PATH)
     sh = gc.open_by_key(GOLD_SPREADSHEET_ID)
 
-    run_stats = []
-
+    logger.info("Gold→Sheets export started")
     with engine.connect() as conn:
         for t in GOLD_TABLES:
-            # Read gold.<table> (Postgres schema-qualified)
-            query = text(f'SELECT * FROM gold."{t}"')
-            df = pd.read_sql_query(query, conn)
-            df = _coerce_types(df)
+            df = pd.read_sql(text(f'SELECT * FROM gold."{t}"'), conn)
 
-            # Ensure a tab exists, clear it, and size it
-            ws, created = _ensure_ws(sh, title=t, rows=len(df) + 1, cols=max(len(df.columns), 1))
+            # optional row cap
+            limit = ROW_LIMITS.get(t)
+            if limit and len(df) > limit:
+                logger.warning(f"Table {t} has {len(df)} rows; exporting only first {limit}.")
+                df = df.head(limit)
 
-            # Single data write (sends values in one call)
-            _retry(
-                set_with_dataframe,
-                ws,
-                df,
-                include_index=False,
-                include_column_header=True,
-                resize=False,
-            )
+            rows_needed = len(df) + 1
+            cols_needed = max(len(df.columns), 1)
+            ws, created = _ensure_ws(sh, title=t, rows=rows_needed, cols=cols_needed)
 
-            # Only do formatting writes once (on first creation)
-            if created:
-                try:
-                    _retry(ws.freeze, rows=1)
-                except Exception:
-                    pass
-                try:
-                    _retry(ws.set_basic_filter)
-                except Exception:
-                    pass
+            _clear_ws(ws)
+            _write_dataframe_chunked(ws, df, chunk_size=CHUNK_ROWS)
 
-            md5 = _md5_df(df)
-            run_stats.append((t, len(df), md5))
-            logging.info(f"Exported {t} | rows={len(df)} | md5={md5}")
+            md5 = pd.util.hash_pandas_object(df.fillna("__NA__"), index=True).sum()
+            logger.info(f"Exported {t} | rows={len(df)} | md5_like={md5}")
 
-            # Throttle between tables to avoid per-minute write caps
-            time.sleep(RATE_LIMIT_SLEEP_PER_TABLE)
-
-    # Meta tab with refresh info
-    meta_rows = [
-        {"key": "last_run_utc", "value": datetime.now(timezone.utc).isoformat()},
-        {"key": "tables_exported", "value": len(run_stats)},
-    ]
-    meta_rows += [{"key": f"rows.{t}", "value": r} for (t, r, _) in run_stats]
-    meta_rows += [{"key": f"md5.{t}", "value": m} for (t, _, m) in run_stats]
-    meta = pd.DataFrame(meta_rows)
-
-    ws_meta, created_meta = _ensure_ws(sh, "meta_refresh", rows=len(meta) + 1, cols=2)
-    _retry(
-        set_with_dataframe,
-        ws_meta,
-        meta,
-        include_index=False,
-        include_column_header=True,
-        resize=False,
-    )
-    if created_meta:
+        # meta tab
         try:
-            _retry(ws_meta.freeze, rows=1)
-        except Exception:
-            pass
-        try:
-            _retry(ws_meta.set_basic_filter)
-        except Exception:
-            pass
+            meta = pd.DataFrame([{
+                "last_export_utc": pd.Timestamp.utcnow().isoformat(timespec="seconds"),
+                "table_count": len(GOLD_TABLES)
+            }])
+            ws_meta, _ = _ensure_ws(sh, title="meta_refresh", rows=5, cols=len(meta.columns))
+            _clear_ws(ws_meta)
+            _write_dataframe_chunked(ws_meta, meta, chunk_size=CHUNK_ROWS)
+        except Exception as e:
+            logger.warning(f"meta_refresh write skipped: {e}")
 
-    logging.info("Gold→Sheets export finished")
-
-
-if __name__ == "__main__":
-    export_gold_to_sheets()
+    logger.info("Gold→Sheets export finished")

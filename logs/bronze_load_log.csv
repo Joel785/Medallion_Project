@@ -1,6 +1,6 @@
 table,file,rows,checksum,status
-bronze.patients,patients.csv,50000,9b224436db13a66c27ed9ef92efefdd4,loaded
-bronze.doctors,doctors.csv,50000,af15091b1b92d0d5af6d4fe3aa06dd7c,loaded
-bronze.appointments,appointments.csv,50000,9b94e836796ecda3827f339529898ba8,loaded
-bronze.prescriptions,prescriptions.csv,50000,d85dfefdad6ed66f5d802f09dd3b4b19,loaded
-bronze.billing,billing.csv,50000,ead7ec27f65c756640414f69b3af10f3,loaded
+bronze.patients,patients.csv,50000,5dba5e3000b61759f9ab7292427f7ed3,loaded
+bronze.doctors,doctors.csv,50000,6f825386c63e4a21373742a02cb14f38,loaded
+bronze.appointments,appointments.csv,50000,f75081e4cd51c3b0f5045709e6b5dc81,loaded
+bronze.prescriptions,prescriptions.csv,50000,8f3d3c124310008af2f82d52f067d563,loaded
+bronze.billing,billing.csv,50000,b98ec6c648036c8b87027afd9c4770f1,loaded
