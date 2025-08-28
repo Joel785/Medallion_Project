@@ -12,3 +12,9 @@ logs/
 # Ignore environment files
 .env
 config/service_account.json
+
+
+# data
+bronze_inputs/*.csv
+reports/*
+logs/*
